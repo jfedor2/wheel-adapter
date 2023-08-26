@@ -30,8 +30,6 @@ Then plug a USB hub into the port you added to the Pico and plug both your wheel
 
 The wheel will operate in Driving Force compatibility mode so even if your wheel has a PlayStation button, it probably won't work. Pressing the "select" and "start" buttons at the same time works as the PlayStation button. If your wheel has more buttons than the basic 12, you probably won't be able to use them as unique buttons (they will work as duplicates of the standard ones).
 
-The wheel will also probably operate in 200 degree mode by default. You have to put it in 900 degree (or whatever) mode manually. On a Driving Force Pro you press "select", R3 and the upshift paddle simultaneously.
-
 ## Q&A
 
 **Will a DualShock 4 work?**

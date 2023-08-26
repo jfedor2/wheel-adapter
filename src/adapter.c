@@ -38,7 +38,7 @@ bool initialized = true;
 
 uint8_t get_buffer[64];
 uint8_t set_buffer[64];
-uint8_t ff_buf[] = { 0x11, 0x08, 0x80, 0x80, 0x00, 0x00, 0x00 };
+uint8_t ff_buf[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 uint8_t prev_ff_buf[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
 g29_report_t report;
@@ -244,7 +244,10 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
             nonce_part = 0;
         }
     } else {
-        ff_buf[2] = buffer[3];
+        if (bufsize > sizeof(ff_buf)) {
+            // pass everything through to the wheel
+            memcpy(ff_buf, buffer + 1, sizeof(ff_buf));
+        }
     }
 }
 
