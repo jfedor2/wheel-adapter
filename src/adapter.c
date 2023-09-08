@@ -17,6 +17,8 @@ uint8_t signature_part = 0;
 uint8_t signature_ready = 0;
 uint8_t nonce_ready = 0;
 
+uint8_t expected_part = 0;
+
 uint8_t wheel_device = 0;
 uint8_t wheel_instance = 0;
 uint8_t auth_device = 0;
@@ -166,6 +168,7 @@ void tuh_hid_get_report_complete_cb(uint8_t dev_addr, uint8_t idx, uint8_t repor
                 printf(".");
                 if (signature_part == 19) {
                     state = IDLE;
+                    expected_part = 0;
                     signature_ready = true;
                     signature_part = 0;
                     printf("\n");
@@ -226,8 +229,11 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
 
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {
     if (report_id == 0xF0) {  // SET_AUTH_PAYLOAD
-        nonce_id = buffer[0];
-        uint8_t part = buffer[1];
+        uint8_t part = expected_part;
+        if (bufsize == 63) {
+            nonce_id = buffer[0];
+            part = buffer[1];
+        }
         if (part == 0) {
             printf("Getting nonce from PS5");
         }
@@ -235,6 +241,7 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
         if (part > 4) {
             return;
         }
+        expected_part = part + 1;
         memcpy(&nonce[part * 56], &buffer[3], 56);
         if (part == 4) {
             nonce_ready = 1;
