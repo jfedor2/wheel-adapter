@@ -39,6 +39,8 @@ elseif(PICO_BOARD STREQUAL "adafruit_feather_rp2040_usb_host")
         PICO_DEFAULT_PIO_USB_VBUSEN_STATE=1
     )
 endif()
+# waveshare_rp2350_usb_a: the SDK board header already puts the USB host port
+# on GPIO 12/13 and the UART on GPIO 0/1, so nothing to add here.
 
 project(adapter)
 
