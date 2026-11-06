@@ -7,6 +7,10 @@
 
 #include "pico/stdio.h"
 
+#ifdef PICO_DEFAULT_PIO_USB_DP_PIN2
+#include "pio_usb.h"
+#endif
+
 #include "reports.h"
 
 uint8_t nonce_id;
@@ -132,6 +136,9 @@ int main() {
     board_init();
     report_init();
     tusb_init();
+#ifdef PICO_DEFAULT_PIO_USB_DP_PIN2
+    pio_usb_host_add_port(PICO_DEFAULT_PIO_USB_DP_PIN2, PIO_USB_PINOUT_DPDM);
+#endif
     stdio_init_all();
 
     while (1) {
