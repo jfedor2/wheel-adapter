@@ -6,4 +6,4 @@
 	url = https://github.com/jfedor2/tinyusb
 [submodule "Pico-PIO-USB"]
 	path = Pico-PIO-USB
-	url = https://github.com/sekigon-gonnoc/Pico-PIO-USB.git
+	url = https://github.com/jfedor2/Pico-PIO-USB
