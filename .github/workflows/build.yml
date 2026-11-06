@@ -31,9 +31,15 @@ jobs:
           PICO_BOARD=pico2 cmake ..
           make
           cd ..
+          mkdir build-feather_rp2040
+          cd build-feather_rp2040
+          PICO_BOARD=adafruit_feather_rp2040_usb_host cmake ..
+          make
+          cd ..
           mkdir artifacts
           mv build/adapter.uf2 artifacts/adapter_pico.uf2
           mv build-pico2/adapter.uf2 artifacts/adapter_pico2.uf2
+          mv build-feather_rp2040/adapter.uf2 artifacts/adapter_feather_rp2040.uf2
       - uses: actions/upload-artifact@v7
         with:
           path: artifacts/*
