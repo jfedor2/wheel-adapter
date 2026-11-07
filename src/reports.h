@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Jacek Fedorynski
+// SPDX-License-Identifier: MIT
+
 #ifndef _REPORTS_H_
 #define _REPORTS_H_
 
