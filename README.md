@@ -25,8 +25,8 @@ To make the device using a Pico, either cut two USB extension cables in half and
 | Pico | USB port or cable |
 | ---: | -------- |
 | GPIO0 (pin 1) | port 1 D+ (typically green) |
-| GPIO1 (pin 2) | port 2 D- (typically white) |
-| GPIO2 (pin 4) | port 1 D+ (typically green) |
+| GPIO1 (pin 2) | port 1 D- (typically white) |
+| GPIO2 (pin 4) | port 2 D+ (typically green) |
 | GPIO3 (pin 5) | port 2 D- (typically white) |
 | VBUS (pin 40) | VBUS/5V on port 1 |
 | VBUS (pin 40) | VBUS/5V on port 2 |
