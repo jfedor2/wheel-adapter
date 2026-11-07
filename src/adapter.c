@@ -46,16 +46,25 @@ bool initialized = true;
 #define LOGITECH_VID 0x046d
 #define PID_DRIVING_FORCE 0xc294  // Driving Force, or another wheel in compatibility mode
 #define PID_DRIVING_FORCE_PRO 0xc298
+#define PID_G25 0xc299
+#define PID_G27 0xc29b
 
 enum {
     WHEEL_NONE = 0,
     WHEEL_DF_COMPAT = 1,      // Driving Force compatibility mode (c294)
-    WHEEL_DFP_SWITCHING = 2,  // Driving Force Pro told to switch to native mode, waiting for it to reconnect
+    WHEEL_SWITCHING = 2,      // wheel told to switch to native mode, waiting for it to reconnect
     WHEEL_DFP_NATIVE = 3,     // Driving Force Pro in native mode (c298)
+    WHEEL_G25_NATIVE = 4,     // G25 (c299) or G27 (c29b) in native mode
 };
 
 uint8_t wheel_mode = WHEEL_NONE;
+uint16_t wheel_bcd_device = 0;
 uint32_t switch_sent_at_ms = 0;
+
+// A G25 or G27 in compatibility mode only switches to native mode when L1+R1+L2+R2
+// are pressed together. This remembers whether they were held in the previous report,
+// so that holding them doesn't keep switching.
+bool switch_combo_held = false;
 
 // If a wheel we told to switch modes hasn't disconnected after this long, use it in compatibility mode.
 #define SWITCH_TIMEOUT_MS 3000
@@ -68,6 +77,8 @@ uint8_t wheel_cmd_head = 0;
 uint8_t wheel_cmd_count = 0;
 
 dfp_report_t prev_dfp_report;
+uint32_t prev_g25_buttons;
+bool native_is_g25 = false;  // G25 or G27 in native mode
 
 uint8_t get_buffer[64];
 uint8_t set_buffer[64];
@@ -160,6 +171,41 @@ bool is_dfp_in_compat_mode(uint16_t bcd_device) {
     return (bcd_device & 0xf000) == 0x1000;
 }
 
+// Same bcdDevice checks as hid-lg4ff, the G27 one has to come first.
+bool is_g27_in_compat_mode(uint16_t bcd_device) {
+    return (bcd_device & 0xfff0) == 0x1230;
+}
+
+bool is_g25_in_compat_mode(uint16_t bcd_device) {
+    return !is_g27_in_compat_mode(bcd_device) && ((bcd_device & 0xff00) == 0x1200);
+}
+
+// Called with every compatibility mode report, switches a G25 or G27 to native mode
+// when L1+R1+L2+R2 are pressed together.
+void check_switch_combo(df_report_t const* df) {
+    bool held = df->L1 && df->R1 && df->L2 && df->R2;
+    bool pressed = held && !switch_combo_held;
+    switch_combo_held = held;
+    if (!pressed) {
+        return;
+    }
+    if (is_g27_in_compat_mode(wheel_bcd_device)) {
+        printf("L1+R1+L2+R2 pressed, switching G27 to native mode\n");
+        wheel_cmd_clear();
+        wheel_cmd_push(0xf8, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00);
+        wheel_cmd_push(0xf8, 0x09, 0x04, 0x01, 0x00, 0x00, 0x00);
+    } else if (is_g25_in_compat_mode(wheel_bcd_device)) {
+        printf("L1+R1+L2+R2 pressed, switching G25 to native mode\n");
+        wheel_cmd_clear();
+        wheel_cmd_push(0xf8, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00);
+    } else {
+        return;
+    }
+    wheel_mode = WHEEL_SWITCHING;
+    initialized = true;
+    switch_sent_at_ms = now_ms();
+}
+
 void hid_task() {
     if (!tud_hid_ready()) {
         return;
@@ -176,7 +222,7 @@ void wheel_task() {
         return;
     }
 
-    if ((wheel_mode == WHEEL_DFP_SWITCHING) && (now_ms() - switch_sent_at_ms > SWITCH_TIMEOUT_MS)) {
+    if ((wheel_mode == WHEEL_SWITCHING) && (now_ms() - switch_sent_at_ms > SWITCH_TIMEOUT_MS)) {
         printf("Wheel didn't switch to native mode, using it in compatibility mode\n");
         wheel_mode = WHEEL_DF_COMPAT;
         initialized = false;
@@ -185,11 +231,14 @@ void wheel_task() {
 
     if (!initialized) {
         initialized = true;
+        // A G29 starts at 900 degrees and games don't necessarily set the range, but
+        // a DFP starts at 200.
         if (wheel_mode == WHEEL_DFP_NATIVE) {
-            // A G29 starts at 900 degrees and games don't necessarily set the range, but
-            // a DFP starts at 200.
             wheel_cmd_push(0xf8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00);  // 900 degree coarse range
             wheel_cmd_push(0x81, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00);  // no fine limit
+        }
+        if (wheel_mode == WHEEL_G25_NATIVE) {
+            wheel_cmd_push(0xf8, 0x81, 0x84, 0x03, 0x00, 0x00, 0x00);  // 900 degrees
         }
         // Disable autocenter. This has to come after the range commands, they turn it back on.
         wheel_cmd_push(0xf5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
@@ -200,7 +249,7 @@ void wheel_task() {
             print_wheel_cmd(wheel_cmd_from_console[wheel_cmd_head], wheel_cmd_queue[wheel_cmd_head]);
             wheel_cmd_head = (wheel_cmd_head + 1) % WHEEL_CMD_QUEUE_SIZE;
             wheel_cmd_count--;
-            if ((wheel_mode == WHEEL_DFP_SWITCHING) && (wheel_cmd_count == 0)) {
+            if ((wheel_mode == WHEEL_SWITCHING) && (wheel_cmd_count == 0)) {
                 switch_sent_at_ms = now_ms();
             }
         }
@@ -368,7 +417,7 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
         // Pass everything through to the wheel. Commands are 7 bytes, after the report ID.
         // Until the wheel is ready to be used they're dropped, the wheel gets initialized
         // on its own when it connects.
-        if ((bufsize >= 8) && (wheel_mode == WHEEL_DF_COMPAT || wheel_mode == WHEEL_DFP_NATIVE)) {
+        if ((bufsize >= 8) && (wheel_mode == WHEEL_DF_COMPAT || wheel_mode == WHEEL_DFP_NATIVE || wheel_mode == WHEEL_G25_NATIVE)) {
             wheel_cmd_enqueue(buffer + 1, true);
         }
     }
@@ -391,16 +440,22 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
 
         wheel_device = dev_addr;
         wheel_instance = instance;
+        wheel_bcd_device = bcd_device;
         wheel_cmd_clear();
+        // Don't switch right away if the buttons are already held when the wheel connects.
+        switch_combo_held = true;
 
         if (is_dfp_in_compat_mode(bcd_device)) {
             // The wheel disconnects and comes back as a Driving Force Pro (c298).
             printf("Driving Force Pro in compatibility mode, switching to native mode\n");
-            wheel_mode = WHEEL_DFP_SWITCHING;
+            wheel_mode = WHEEL_SWITCHING;
             initialized = true;
             switch_sent_at_ms = now_ms();
             wheel_cmd_push(0xf8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
         } else {
+            if (is_g25_in_compat_mode(bcd_device) || is_g27_in_compat_mode(bcd_device)) {
+                printf("G25/G27 in compatibility mode, press L1+R1+L2+R2 to switch to native mode\n");
+            }
             wheel_mode = WHEEL_DF_COMPAT;
             initialized = false;
             tuh_hid_receive_report(dev_addr, instance);
@@ -412,6 +467,16 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
         wheel_mode = WHEEL_DFP_NATIVE;
         wheel_cmd_clear();
         memset(&prev_dfp_report, 0, sizeof(prev_dfp_report));
+        initialized = false;
+        tuh_hid_receive_report(dev_addr, instance);
+    } else if ((vid == LOGITECH_VID) && ((pid == PID_G25) || (pid == PID_G27))) {
+        printf("%s in native mode\n", (pid == PID_G25) ? "G25" : "G27");
+        wheel_device = dev_addr;
+        wheel_instance = instance;
+        wheel_mode = WHEEL_G25_NATIVE;
+        wheel_cmd_clear();
+        prev_g25_buttons = 0;
+        native_is_g25 = (pid == PID_G25);
         initialized = false;
         tuh_hid_receive_report(dev_addr, instance);
     } else {  // assume everything else is the controller we use for authentication
@@ -469,6 +534,42 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
                 printf("DFP: %02x %02x %02x %02x %02x %02x %02x %02x\n", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
                 prev_dfp_report = masked;
             }
+        } else if ((dev_addr == wheel_device) && (wheel_mode == WHEEL_G25_NATIVE) && (len >= sizeof(g25_report_t))) {
+            g25_report_t const* g25 = (g25_report_t const*) report_;
+            uint32_t buttons = g25->buttons;
+            report.wheel = g25->wheel << 2;
+            report.throttle = g25->throttle << 8;
+            report.brake = g25->brake << 8;
+            report.clutch = g25->clutch << 8;
+            report.dpad = g25->hat;
+            report.cross = (buttons >> 0) & 1;
+            report.square = (buttons >> 1) & 1;
+            report.circle = (buttons >> 2) & 1;
+            report.triangle = (buttons >> 3) & 1;
+            report.R1 = (buttons >> 4) & 1;
+            report.L1 = (buttons >> 5) & 1;
+            report.R2 = (buttons >> 6) & 1;
+            report.L2 = (buttons >> 7) & 1;
+            report.PS = (buttons >> 8) & 1;  // select works as the PS button, the console never sees select
+            report.start = (buttons >> 9) & 1;
+            report.R3 = (buttons >> 10) & 1;
+            report.L3 = (buttons >> 11) & 1;
+            report.gears = (buttons >> 12) & 0x3f;  // gears 1-6
+            if (native_is_g25) {
+                report.gears |= ((buttons >> 18) & 1) << 7;  // reverse
+            } else {
+                // The four extra buttons on the G27 wheel.
+                report.plus = (buttons >> 18) & 1;
+                report.minus = (buttons >> 19) & 1;
+                report.dial_up = (buttons >> 20) & 1;
+                report.dial_down = (buttons >> 21) & 1;
+            }
+
+            // Print button changes so that we can check the mapping.
+            if (buttons != prev_g25_buttons) {
+                printf("%s buttons: %06lx\n", native_is_g25 ? "G25" : "G27", (unsigned long) buttons);
+                prev_g25_buttons = buttons;
+            }
         } else if ((dev_addr == wheel_device) && (wheel_mode == WHEEL_DF_COMPAT)) {
             df_report_t* df = (df_report_t*) report_;
             report.wheel = df->wheel << 6;
@@ -487,6 +588,7 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
             report.start = df->start;
             report.R3 = df->R3;
             report.L3 = df->L3;
+            check_switch_combo(df);
         }
     }
 

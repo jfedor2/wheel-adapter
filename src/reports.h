@@ -94,4 +94,23 @@ typedef struct __attribute__((packed)) {
 
 _Static_assert(sizeof(dfp_report_t) == 8, "dfp_report_t should be 8 bytes");
 
+// G25 and G27 HID report (native mode), from memory of the wheels' report descriptors,
+// not checked against real hardware. The G27 uses all 22 buttons, the G25 only 19.
+// Assumed button numbering (1-based):
+//   1-12   same order as the 12 buttons in compatibility mode
+//   13-18  shifter gears 1-6 (H-pattern)
+//   19     G25: reverse, G27: extra wheel button
+//   20-22  G27: extra wheel buttons
+typedef struct __attribute__((packed)) {
+    uint64_t hat : 4;
+    uint64_t buttons : 22;  // button 1 is bit 0
+    uint64_t wheel : 14;
+    uint64_t throttle : 8;
+    uint64_t brake : 8;
+    uint64_t clutch : 8;
+    uint8_t shifter[3];  // raw shifter position and flags
+} g25_report_t;
+
+_Static_assert(sizeof(g25_report_t) == 11, "g25_report_t should be 11 bytes");
+
 #endif
