@@ -1,0 +1,23 @@
+name: release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags: 'r*'
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+  create-release:
+    needs: [ build ]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: download
+      - run: gh release create "$GITHUB_REF_NAME" download/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes ""
+        env:
+          GH_TOKEN: ${{ github.token }}
