@@ -6,6 +6,7 @@
 #include "tusb.h"
 
 #include "pico/stdio.h"
+#include "pico/time.h"
 
 #ifdef PICO_DEFAULT_PIO_USB_DP_PIN2
 #include "pio_usb.h"
@@ -42,10 +43,34 @@ uint8_t state = IDLE;
 
 bool initialized = true;
 
+#define LOGITECH_VID 0x046d
+#define PID_DRIVING_FORCE 0xc294  // Driving Force, or another wheel in compatibility mode
+#define PID_DRIVING_FORCE_PRO 0xc298
+
+enum {
+    WHEEL_NONE = 0,
+    WHEEL_DF_COMPAT = 1,      // Driving Force compatibility mode (c294)
+    WHEEL_DFP_SWITCHING = 2,  // Driving Force Pro told to switch to native mode, waiting for it to reconnect
+    WHEEL_DFP_NATIVE = 3,     // Driving Force Pro in native mode (c298)
+};
+
+uint8_t wheel_mode = WHEEL_NONE;
+uint32_t switch_sent_at_ms = 0;
+
+// If a wheel we told to switch modes hasn't disconnected after this long, use it in compatibility mode.
+#define SWITCH_TIMEOUT_MS 3000
+
+// Commands waiting to be sent to the wheel, both our own and the ones from the console.
+#define WHEEL_CMD_QUEUE_SIZE 32
+uint8_t wheel_cmd_queue[WHEEL_CMD_QUEUE_SIZE][7];
+bool wheel_cmd_from_console[WHEEL_CMD_QUEUE_SIZE];
+uint8_t wheel_cmd_head = 0;
+uint8_t wheel_cmd_count = 0;
+
+dfp_report_t prev_dfp_report;
+
 uint8_t get_buffer[64];
 uint8_t set_buffer[64];
-uint8_t ff_buf[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-uint8_t prev_ff_buf[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
 g29_report_t report;
 g29_report_t prev_report;
@@ -72,6 +97,69 @@ void report_init() {
     memcpy(&prev_report, &report, sizeof(report));
 }
 
+// Repeated force updates would flood the UART, so a console command is only printed
+// if its first two bytes differ from the previous one.
+void print_wheel_cmd(bool from_console, uint8_t const* cmd) {
+    static uint8_t last[2];
+    if (from_console && (cmd[0] == last[0]) && (cmd[1] == last[1])) {
+        return;
+    }
+    if (from_console) {
+        last[0] = cmd[0];
+        last[1] = cmd[1];
+    }
+    printf("%s -> wheel: %02x %02x %02x %02x %02x %02x %02x\n", from_console ? "console" : "adapter", cmd[0], cmd[1], cmd[2], cmd[3], cmd[4], cmd[5], cmd[6]);
+}
+
+uint32_t now_ms() {
+    return to_ms_since_boot(get_absolute_time());
+}
+
+void wheel_cmd_clear() {
+    wheel_cmd_head = 0;
+    wheel_cmd_count = 0;
+}
+
+void wheel_cmd_enqueue(uint8_t const* cmd, bool from_console) {
+    if (from_console && (wheel_cmd_count > 0)) {
+        // If the last command still waiting is the console's and of the same kind (same
+        // command and slots, same extended command), the new one replaces it. This keeps
+        // repeated force updates from piling up when the wheel accepts them slower than the
+        // console sends them, without reordering anything.
+        uint8_t tail = (wheel_cmd_head + wheel_cmd_count - 1) % WHEEL_CMD_QUEUE_SIZE;
+        uint8_t* last = wheel_cmd_queue[tail];
+        if (wheel_cmd_from_console[tail] && (last[0] == cmd[0]) && (last[1] == cmd[1])) {
+            memcpy(last, cmd, 7);
+            return;
+        }
+    }
+    if (wheel_cmd_count == WHEEL_CMD_QUEUE_SIZE) {
+        printf("wheel command queue full, dropping %02x %02x\n", cmd[0], cmd[1]);
+        return;
+    }
+    uint8_t idx = (wheel_cmd_head + wheel_cmd_count) % WHEEL_CMD_QUEUE_SIZE;
+    memcpy(wheel_cmd_queue[idx], cmd, 7);
+    wheel_cmd_from_console[idx] = from_console;
+    wheel_cmd_count++;
+}
+
+void wheel_cmd_push(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4, uint8_t b5, uint8_t b6) {
+    uint8_t cmd[7] = { b0, b1, b2, b3, b4, b5, b6 };
+    wheel_cmd_enqueue(cmd, false);
+}
+
+// We only care about the Driving Force Pro for now.
+bool is_dfp_in_compat_mode(uint16_t bcd_device) {
+    if ((bcd_device & 0xfff8) == 0x1350 ||  // G29
+        (bcd_device & 0xff00) == 0x8900 ||  // G29
+        (bcd_device & 0xff00) == 0x1300 ||  // DFGT
+        (bcd_device & 0xfff0) == 0x1230 ||  // G27
+        (bcd_device & 0xff00) == 0x1200) {  // G25
+        return false;
+    }
+    return (bcd_device & 0xf000) == 0x1000;
+}
+
 void hid_task() {
     if (!tud_hid_ready()) {
         return;
@@ -81,20 +169,41 @@ void hid_task() {
         tud_hid_report(1, &report, sizeof(report));
         memcpy(&prev_report, &report, sizeof(report));
     }
-
-    if (memcmp(prev_ff_buf, ff_buf, sizeof(ff_buf))) {
-        if (wheel_device) {
-            tuh_hid_send_report(wheel_device, wheel_instance, 0, ff_buf, sizeof(ff_buf));
-        }
-        memcpy(prev_ff_buf, ff_buf, sizeof(ff_buf));
-    }
 }
 
-void wheel_init_task() {
-    if (wheel_device && !initialized) {
+void wheel_task() {
+    if (!wheel_device) {
+        return;
+    }
+
+    if ((wheel_mode == WHEEL_DFP_SWITCHING) && (now_ms() - switch_sent_at_ms > SWITCH_TIMEOUT_MS)) {
+        printf("Wheel didn't switch to native mode, using it in compatibility mode\n");
+        wheel_mode = WHEEL_DF_COMPAT;
+        initialized = false;
+        tuh_hid_receive_report(wheel_device, wheel_instance);
+    }
+
+    if (!initialized) {
         initialized = true;
-        static uint8_t buf[] = { 0xf5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };  // disable autocenter
-        tuh_hid_send_report(wheel_device, wheel_instance, 0, buf, sizeof(buf));
+        if (wheel_mode == WHEEL_DFP_NATIVE) {
+            // A G29 starts at 900 degrees and games don't necessarily set the range, but
+            // a DFP starts at 200.
+            wheel_cmd_push(0xf8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00);  // 900 degree coarse range
+            wheel_cmd_push(0x81, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00);  // no fine limit
+        }
+        // Disable autocenter. This has to come after the range commands, they turn it back on.
+        wheel_cmd_push(0xf5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+    }
+
+    if ((wheel_cmd_count > 0) && tuh_hid_send_ready(wheel_device, wheel_instance)) {
+        if (tuh_hid_send_report(wheel_device, wheel_instance, 0, wheel_cmd_queue[wheel_cmd_head], 7)) {
+            print_wheel_cmd(wheel_cmd_from_console[wheel_cmd_head], wheel_cmd_queue[wheel_cmd_head]);
+            wheel_cmd_head = (wheel_cmd_head + 1) % WHEEL_CMD_QUEUE_SIZE;
+            wheel_cmd_count--;
+            if ((wheel_mode == WHEEL_DFP_SWITCHING) && (wheel_cmd_count == 0)) {
+                switch_sent_at_ms = now_ms();
+            }
+        }
     }
 }
 
@@ -144,7 +253,7 @@ int main() {
         tud_task();
         hid_task();
         auth_task();
-        wheel_init_task();
+        wheel_task();
     }
 
     return 0;
@@ -256,9 +365,11 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
             nonce_part = 0;
         }
     } else {
-        if (bufsize > sizeof(ff_buf)) {
-            // pass everything through to the wheel
-            memcpy(ff_buf, buffer + 1, sizeof(ff_buf));
+        // Pass everything through to the wheel. Commands are 7 bytes, after the report ID.
+        // Until the wheel is ready to be used they're dropped, the wheel gets initialized
+        // on its own when it connects.
+        if ((bufsize >= 8) && (wheel_mode == WHEEL_DF_COMPAT || wheel_mode == WHEEL_DFP_NATIVE)) {
+            wheel_cmd_enqueue(buffer + 1, true);
         }
     }
 }
@@ -270,11 +381,39 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
 
     printf("tuh_hid_mount_cb %04x:%04x %d %d\n", vid, pid, dev_addr, instance);
 
-    if ((vid == 0x046d) && (pid == 0xc294)) {  // Driving Force (or another wheel in compatibility mode)
+    if ((vid == LOGITECH_VID) && (pid == PID_DRIVING_FORCE)) {
+        tusb_desc_device_t desc;
+        uint16_t bcd_device = 0;
+        if (tuh_descriptor_get_device_local(dev_addr, &desc)) {
+            bcd_device = desc.bcdDevice;
+        }
+        printf("bcdDevice %04x\n", bcd_device);
+
         wheel_device = dev_addr;
         wheel_instance = instance;
-        tuh_hid_receive_report(dev_addr, instance);
+        wheel_cmd_clear();
+
+        if (is_dfp_in_compat_mode(bcd_device)) {
+            // The wheel disconnects and comes back as a Driving Force Pro (c298).
+            printf("Driving Force Pro in compatibility mode, switching to native mode\n");
+            wheel_mode = WHEEL_DFP_SWITCHING;
+            initialized = true;
+            switch_sent_at_ms = now_ms();
+            wheel_cmd_push(0xf8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00);
+        } else {
+            wheel_mode = WHEEL_DF_COMPAT;
+            initialized = false;
+            tuh_hid_receive_report(dev_addr, instance);
+        }
+    } else if ((vid == LOGITECH_VID) && (pid == PID_DRIVING_FORCE_PRO)) {
+        printf("Driving Force Pro in native mode\n");
+        wheel_device = dev_addr;
+        wheel_instance = instance;
+        wheel_mode = WHEEL_DFP_NATIVE;
+        wheel_cmd_clear();
+        memset(&prev_dfp_report, 0, sizeof(prev_dfp_report));
         initialized = false;
+        tuh_hid_receive_report(dev_addr, instance);
     } else {  // assume everything else is the controller we use for authentication
         auth_device = dev_addr;
         auth_instance = instance;
@@ -286,6 +425,8 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
     if (dev_addr == wheel_device) {
         wheel_device = 0;
         wheel_instance = 0;
+        wheel_mode = WHEEL_NONE;
+        wheel_cmd_clear();
     }
     if (dev_addr == auth_device) {
         auth_device = 0;
@@ -295,7 +436,40 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
 
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* report_, uint16_t len) {
     if (len > 0) {
-        if (dev_addr == wheel_device) {
+        if ((dev_addr == wheel_device) && (wheel_mode == WHEEL_DFP_NATIVE) && (len >= sizeof(dfp_report_t))) {
+            dfp_report_t* dfp = (dfp_report_t*) report_;
+            report.wheel = dfp->wheel << 2;
+            report.throttle = dfp->throttle << 8;
+            report.brake = dfp->brake << 8;
+            report.dpad = dfp->hat;
+            report.cross = dfp->cross;
+            report.square = dfp->square;
+            report.circle = dfp->circle;
+            report.triangle = dfp->triangle;
+            report.L2 = dfp->L2;
+            report.L1 = dfp->L1;
+            report.R2 = dfp->R2;
+            report.R1 = dfp->R1;
+            // The gear lever gets its own buttons, which can be mapped separately in games.
+            report.plus = dfp->upshift;
+            report.minus = dfp->downshift;
+            report.PS = dfp->select;  // select works as the PS button, the console never sees select
+            report.start = dfp->start;
+            report.R3 = dfp->R3;
+            report.L3 = dfp->L3;
+
+            // Print button changes so that we can check the mapping (wheel and pedals left out).
+            dfp_report_t masked = *dfp;
+            masked.wheel = 0;
+            masked.y = 0;
+            masked.throttle = 0;
+            masked.brake = 0;
+            if (memcmp(&masked, &prev_dfp_report, sizeof(masked))) {
+                uint8_t const* b = (uint8_t const*) dfp;
+                printf("DFP: %02x %02x %02x %02x %02x %02x %02x %02x\n", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+                prev_dfp_report = masked;
+            }
+        } else if ((dev_addr == wheel_device) && (wheel_mode == WHEEL_DF_COMPAT)) {
             df_report_t* df = (df_report_t*) report_;
             report.wheel = df->wheel << 6;
             report.throttle = df->throttle << 8;
