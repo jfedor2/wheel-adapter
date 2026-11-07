@@ -77,8 +77,6 @@ void hid_task() {
         return;
     }
 
-    report.PS = report.select && report.start;
-
     if (memcmp(&prev_report, &report, sizeof(report))) {
         tud_hid_report(1, &report, sizeof(report));
         memcpy(&prev_report, &report, sizeof(report));
@@ -311,7 +309,7 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
             report.L1 = df->L1;
             report.R2 = df->R2;
             report.R1 = df->R1;
-            report.select = df->select;
+            report.PS = df->select;  // select works as the PS button, the console never sees select
             report.start = df->start;
             report.R3 = df->R3;
             report.L3 = df->L3;

@@ -28,7 +28,7 @@ Then plug a USB hub into the port you added to the Pico and plug both your wheel
 
 ![Diagram of the connections](diagram.png)
 
-The wheel will operate in Driving Force compatibility mode so even if your wheel has a PlayStation button, it probably won't work. Pressing the "select" and "start" buttons at the same time works as the PlayStation button. If your wheel has more buttons than the basic 12, you probably won't be able to use them as unique buttons (they will work as duplicates of the standard ones).
+The wheel will operate in Driving Force compatibility mode so even if your wheel has a PlayStation button, it probably won't work. The "select" button works as the PlayStation button (so there's no way to press select/share). If your wheel has more buttons than the basic 12, you probably won't be able to use them as unique buttons (they will work as duplicates of the standard ones).
 
 ## Q&A
 
